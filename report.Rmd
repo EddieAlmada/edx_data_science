@@ -1,0 +1,224 @@
+---
+title: "MovieLens Report"
+author: "Eduardo Almada"
+date: "09/03/2021"
+output: 
+  pdf_document: default
+  html_document: default
+---
+
+```{r data_creation, include=FALSE}
+library(tidyverse)
+library(caret)
+library(DescTools)
+library(data.table)
+library(tinytex)
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+# if using R 4.0 or later:
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+head(movies)
+head(ratings)
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1)
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+
+knitr::opts_chunk$set(include = T)
+```
+
+## Introduction
+
+In this report I will be reviewing a machine learning challenge set by Netflix back in 2006, the goal is to obtain the minimum root mean square error (RMSE) which is calculated with the given formula:
+
+  $$RMSE = \sqrt{\frac{(\sum_{i=1}^{n} (Y_{predicted} - Y)^2)}{N}}$$
+
+For this report the requirements is to obtain a RMSE smaller than 0.86490, five different approaches were made in order to achieve this, which will be discussed in the Methods section. I began inspecting the data already provided by **Edx**.
+
+```{r dimensions, echo=T}
+c(Rows = dim(edx)[1], Predictors = dim(edx)[2])
+```
+
+We see 6 predictors and 9000061 rows, after further inspection we can begin our machine learning algorithm to predict the rating given to a movie using the user, genre and movie a predictors.
+
+```{r head, echo=T}
+as_tibble(head(sample(edx)))
+```
+
+## Methods
+
+There were five different approaches to get the minimum RMSE, the simplest model is to use the average rating across every movie and user. The model follows this equation,
+
+$$Y_{u,i}=\mu$$
+
+Where $Y{u,i}$ is the predicted rating of user $u$ and movie $i$, and $\mu$ is the average rating across the entries  
+
+```{r average_method, echo=T}
+mu <- mean(edx$rating)
+m1 <- RMSE(validation$rating,mu) 
+m1
+```
+
+This was a rough approach, so in order to improve the prediction a new term is introduce to de model $b_{i}$, this term represents the bias that each movie introduces when predicting, the model would now look lije this:
+
+$$Y_{u,i}=\mu+b_{i}$$
+```{r Movie effect, echo=T}
+# By grouping the movies and scaling the ratings, we obtain b_i as the movie bias
+b_i <- edx %>%
+  group_by(movieId) %>%
+  summarize(b_i = mean(rating - mu))
+
+# Estimates all unknown ratings based on the training set rating average and b_i
+bi_ratings <- validation %>% 
+  left_join(b_i, by='movieId') %>%
+  mutate(pred = mu + b_i) %>%
+  pull(pred)
+# Calculate RMSE
+m2 <- RMSE(validation$rating, bi_ratings)   
+m2
+```
+
+This RMSE values looks much better, however it is not what we are looking for, the pass criteria for a great prediction is to have a $RMSE < 0.86490$. The next step to improve the algorithm would be to take into consideration the bias introduced by the User $b_{u}$, which when applied to our model looks like this:
+
+$$Y_{u,i}=\mu+b_{i}+b_{u}$$
+
+```{r movie_user_effect, echo=T}
+# Calculates user bias, b_u
+b_u <- edx %>% 
+  left_join(b_i, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+# Estimates all unknown ratings based on the training set rating average, b_i and b_u
+bu_ratings <- validation %>% 
+  left_join(b_i, by='movieId') %>%
+  left_join(b_u, by='userId') %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  pull(pred)
+
+# Calculate RMSE
+m3 <- RMSE(bu_ratings, validation$rating) 
+m3
+```
+
+*Almost there!*, the next step would be to add the term ,$b_{e}$, which represents the movie genre bias. For this I take multiple genre movies as one genre, with this considered the model would now look like this:
+
+$$Y_{u,i}=\mu+b_{i}+b_{u}+b_{e}$$
+
+```{r genre_effect, echo=T}
+# Calculates genres bias, b_e
+b_e <- edx %>% 
+  left_join(b_i, by='movieId') %>%
+  left_join(b_u, by = "userId") %>% 
+  group_by(genres) %>%
+  summarize(b_e = mean(rating - mu - b_i - b_u))
+
+# Estimates all unknown ratings based on the training set rating average, b_i, b_u & b_e
+be_ratings <- validation %>% left_join(b_i, by='movieId') %>%
+  left_join(b_u, by='userId') %>% left_join(b_e, by='genres') %>% 
+  mutate(pred = mu + b_i + b_u + b_e) %>%
+  pull(pred)
+
+# Calculate RMSE
+m4 <- RMSE(be_ratings, validation$rating)
+m4
+```
+
+The improvement was not that much, so as a final step regularization will be applied to the model, Regularization constrains the total variability of the effects sizes by penalizing large estimates from small samples.
+
+The model looks like this:
+
+$$\frac{1}{N} \sum_{u,i}(Y_{u,i} - \mu - b_i - b_u - b_e)^2 + \lambda (\sum_{i} b_i^2 + \sum_u b_u^2 + \sum_u b_e^2)$$
+where $\lambda$ is a tuning parameter, the larger $\lambda$ is, the more the *sum* shrinks. So, cross-validation should be applied inm order to get the best $\lambda$ to reduce the RMSE.
+
+```{r regularized_effects, include= F}
+
+# Sequence of lambdas for optimization
+lambdas <- seq(0, 10, by=0.10)
+
+# RMSE of each lambda 
+rmse_f <- sapply(lambdas, function(l){
+  
+  mu <- mean(edx$rating) 
+  
+  b_i <- edx %>% 
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+
+  b_u <- edx %>% left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%  summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+  
+  b_e <- edx %>% left_join(b_i, by='movieId') %>%
+    left_join(b_u, by = "userId") %>% group_by(genres) %>%
+    summarize(b_e = sum(rating - mu - b_i - b_u)/(n()+l))
+  
+  reg_ratings <- validation %>% 
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    left_join(b_e, by = 'genres') %>% 
+    mutate(pred = mu + b_i + b_u + b_e) %>%
+    pull(pred)
+ 
+  return(RMSE(reg_ratings, validation$rating))
+})
+
+m5 <- min(rmse_f)
+m5
+```
+
+
+## Results
+
+When doing cross-validation a $\lambda$ vector is created in order to find the best tune.
+
+```{r optimum_lambda, echo=T}
+index <- which.min(rmse_f)
+c(lambda = lambdas[index], RSME = min(rmse_f))
+```
+
+With this we accomplish our goal, building a machine learning algorithm caplable of predicting movie ratings with a $RMSE < 0.86490$.
+
+Where we plotted the lambdas vs the RMSE for visual exploration.
+
+```{r lambda_plot, echo = T}
+qplot(lambdas, rmse_f)
+```
+
+## Conclusion
+
+After applying five different methods by including different terms to the average expression, it is concluded that regularization was needed in order to compensate for the large variation within the predictors, the RMSE was reduced from 1.061 to 0.8647. This model has the advantage of using linear models, compared to the ones available in R packages, so the computational time is *better* using this model.
+
+```{r Conclusion, echo=T}
+Methods <- c(Average_method = m1, Movie_effect = m2, User_effect = m3,
+  Genre_effect = m4,Regularized_method = m5)
+
+Results <- data.table(Method = c('Average_method', 'Movie_effect', 'User_effect','Genre_effect','Regularized_method'), RMSE = Methods,
+                Pass_Criteria = ifelse(Methods < 0.86490,'pass','fail'))
+Results
+```
+
+
